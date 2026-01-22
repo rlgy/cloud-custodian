@@ -3,6 +3,9 @@
 import base64
 import logging
 import re
+import functools
+import time
+import json
 
 from huaweicloudsdkkms.v2 import ShowPublicKeyRequest, OperateKeyRequestBody, ShowPublicKeyResponse
 
@@ -12,6 +15,8 @@ from c7n_huaweicloud.provider import resources
 from c7n_huaweicloud.actions.base import HuaweiCloudBaseAction
 from c7n.utils import local_session, type_schema
 from huaweicloudsdkcore.exceptions import exceptions
+from c7n_huaweicloud.filters.exempted import get_obs_name, get_obs_server, get_file_path
+from c7n.exceptions import PolicyValidationError, PolicyExecutionError
 
 # Import Huawei Cloud CCE SDK related request and response classes
 from huaweicloudsdkcce.v3 import (
@@ -30,7 +35,7 @@ from huaweicloudsdkcce.v3 import (
     ShowClusterConfigResponse, ClusterLogConfigLogConfigs,
     ListAddonTemplatesRequest, ListAddonTemplatesResponse,
     Versions, SupportVersions, CreateAddonInstanceRequest,
-    InstanceRequest, AddonMetadata, InstanceRequestSpec
+    InstanceRequest, AddonMetadata, InstanceRequestSpec, ShowClusterRequest
 )
 
 log = logging.getLogger("custodian.huaweicloud.cce")
@@ -165,6 +170,11 @@ class DeleteCceCluster(HuaweiCloudBaseAction):
         client = self.manager.get_client()
 
         try:
+
+            cluster_status = resource.get("status", {}).get("phase")
+            if cluster_status != "Available" and cluster_status != "Error":
+                wait_cluster_status_ready(client, cluster_id, "Available,Error", 10, 30, 600)
+
             # Build delete cluster request
             request = DeleteClusterRequest()
             request.cluster_id = cluster_id
@@ -238,6 +248,12 @@ class HibernateCceCluster(HuaweiCloudBaseAction):
         client = self.manager.get_client()
 
         try:
+            cluster_status = resource.get("status", {}).get("phase")
+            if cluster_status == "Hibernating" or cluster_status == "Hibernation":
+                return None
+            if cluster_status != "Available":
+                wait_cluster_status_ready(client, cluster_id, "Available", 10, 30, 600)
+
             request = HibernateClusterRequest()
             request.cluster_id = cluster_id
 
@@ -671,34 +687,6 @@ class ClusterSignatureEnabledFilter(Filter):
             raise
 
 
-def if_version_support(cluster_version: str, cluster_type: str,
-                       support_versions: list[SupportVersions]) -> bool:
-    for _, support_version in enumerate(support_versions):
-        if support_version.cluster_type != cluster_type:
-            continue
-        for _, ver in enumerate(support_version.cluster_version):
-            p = re.compile(ver)
-            if p.match(cluster_version):
-                return True
-    return False
-
-
-def version_key(version: str) -> list[int]:
-    return [int(v) for v in version.split('.')]
-
-
-def get_matched_flavor(cluster_flavor, flavors):
-    custom = {}
-    for k, v in flavors.items():
-        if "flavor" not in k:
-            continue
-        if v["size"] in cluster_flavor:
-            return v
-        if v["size"] == "custom":
-            custom = v
-    return custom
-
-
 @CceCluster.action_registry.register("enable-cluster-signature")
 class EnableClusterSignature(HuaweiCloudBaseAction):
     """
@@ -722,7 +710,8 @@ class EnableClusterSignature(HuaweiCloudBaseAction):
     plugin_name = "swr-cosign"
     schema = type_schema("enable-cluster-signature",
                          public_key={"type": "string", "default": ''},
-                         kms_id={"type": "string", "default": ''})
+                         kms_id={"type": "string", "default": ''},
+                         obs_url={"type": "string", "default": ''})
     permissions = ('cce:enableClusterSignature',)
 
     def perform_action(self, resource):
@@ -810,6 +799,12 @@ class EnableClusterSignature(HuaweiCloudBaseAction):
             return self.data.get('public_key')
         public_id = self.data.get('kms_id', '')
 
+        obs_url = self.data.get('obs_url', '')
+        if obs_url != '':
+            context = self.get_file_content(obs_url)
+            if 'signature_key' in context:
+                public_id = context['signature_key']
+
         if public_id is None or len(public_id) == 0:
             log.error(
                 f"[actions]- [{self.action_name}]- The resource:[huaweicloud.cce-cluster] with "
@@ -878,6 +873,38 @@ class EnableClusterSignature(HuaweiCloudBaseAction):
                 f" cause: install {self.plugin_name} failed,"
                 f" {str(e)}")
             raise
+
+    def get_file_content(self, obs_url):
+        if not obs_url:
+            return {}
+        obs_client = local_session(self.manager.session_factory).client("obs")
+        protocol_end = len("https://")
+        path_without_protocol = obs_url[protocol_end:]
+        obs_bucket_name = get_obs_name(path_without_protocol)
+        obs_server = get_obs_server(path_without_protocol)
+        obs_file = get_file_path(path_without_protocol)
+        obs_client.server = obs_server
+        try:
+            resp = obs_client.getObject(bucketName=obs_bucket_name,
+                                        objectKey=obs_file,
+                                        loadStreamInMemory=True)
+            if resp.status < 300:
+                log.debug(f"[action]-[{self.action_name}]-"
+                          f"query the service:[OBS:getObject] with obs_url:[{obs_url}] succeed.")
+                content = json.loads(resp.body.buffer)
+                return content
+            else:
+                log.error(f"[filters]-[{self.action_name}]-"
+                          f"cause: get obs object with obs_url:[{obs_url}] failed, "
+                          f"error_code[{resp.errorCode}], error_msg[{resp.errorMessage}].")
+                raise PolicyExecutionError("Get obs object failed, "
+                                           f"error_code[{resp.errorCode}], "
+                                           f"error_msg[{resp.errorMessage}]")
+        except exceptions.ServiceResponseException as ex:
+            log.error(f"[filters]-[{self.action_name}]-"
+                      f"cause: get obs object with obs_url:[{obs_url}] failed, "
+                      f"error_code[{ex.error_code}], error_msg[{ex.error_msg}].")
+            raise ex
 
 
 @resources.register("cce-nodepool")
@@ -1810,3 +1837,97 @@ class DeleteCceRelease(HuaweiCloudBaseAction):
             log.error(
                 f"Error occurred while deleting CCE release {release_name}: {str(e)}")
             return None
+
+
+class NoRetry(Exception):
+    def __init__(self, reason):
+        super(NoRetry, self).__init__(reason)
+        self.reason = reason
+
+    def __str__(self):
+        return "NoRetry(reason=%s)" % self.reason
+
+
+def retry(times=-1, interval=5, timeout=-1):
+    """
+    :param times: 重试次数，times = 0，表示不重试；times < 0，表示无限重试
+    :param interval: 间隔多久时间重试，单位秒
+    :param timeout: timout < 0 无超时设置；
+                    timeout = 0，表示不重试；
+                    timeout > 0，表示超时上限（单位秒），如果发生错误时，用时超过timeout，不再重试
+    :return:: deco 实现重试功能的装饰器
+    """
+
+    # 防止无限重试
+    assert times >= 0 or timeout >= 0, 'times and timeout should be given'
+
+    def deco(func):
+
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            n = 0
+            st = time.perf_counter()
+            while True:
+                n += 1
+                try:
+                    ret = func(*args, **kwargs)
+                    return ret
+                except Exception as e:
+                    if isinstance(e, NoRetry):
+                        raise
+                    if 0 <= times <= n - 1:
+                        raise
+                    if timeout == 0:
+                        raise
+                    if 0 < timeout <= time.perf_counter() - st:
+                        raise
+                    if interval > 0:
+                        time.sleep(interval)
+
+        return wrapped
+
+    return deco
+
+
+def if_version_support(cluster_version: str, cluster_type: str,
+                       support_versions: list[SupportVersions]) -> bool:
+    for _, support_version in enumerate(support_versions):
+        if support_version.cluster_type != cluster_type:
+            continue
+        for _, ver in enumerate(support_version.cluster_version):
+            p = re.compile(ver)
+            if p.match(cluster_version):
+                return True
+    return False
+
+
+def version_key(version: str) -> list[int]:
+    return [int(v) for v in version.split('.')]
+
+
+def get_matched_flavor(cluster_flavor, flavors):
+    custom = {}
+    for k, v in flavors.items():
+        if "flavor" not in k:
+            continue
+        if v["size"] in cluster_flavor:
+            return v
+        if v["size"] == "custom":
+            custom = v
+    return custom
+
+
+def get_cluster_status(client: CceClient, cluster_id: str) -> str:
+    request = ShowClusterRequest(cluster_id)
+    response = client.show_cluster(request)
+    assert response.status.phase
+
+
+def wait_cluster_status_ready(client: CceClient, cluster_id: str, cluster_status: str, times: int,
+                              interval: int, timeout: int):
+    @retry(times=times, interval=interval, timeout=timeout)
+    def _wait():
+        curr_status = get_cluster_status(client, cluster_id)
+        assert curr_status not in cluster_status, "invalid status %s" % curr_status
+
+    _wait()
